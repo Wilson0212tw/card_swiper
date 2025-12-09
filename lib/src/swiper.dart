@@ -1,5 +1,3 @@
-// ignore_for_file: constant_identifier_names
-
 import 'dart:async';
 import 'dart:developer';
 
@@ -72,10 +70,14 @@ class Swiper extends StatefulWidget {
     this.scale,
     this.fade,
     this.allowImplicitScrolling = false,
-    this.allowScrolling = true,
   })  : assert(
           itemBuilder != null || transformer != null,
-          'itemBuilder and transformItemBuilder must not be both null',
+          'Either itemBuilder or transformer must be provided.',
+        ),
+        // 當 layout == DEFAULT 時，itemBuilder 必須存在
+        assert(
+          !(layout == SwiperLayout.DEFAULT && itemBuilder == null),
+          'itemBuilder must not be null when layout == SwiperLayout.DEFAULT (PageView layout).',
         ),
         assert(
             !loop ||
@@ -85,7 +87,7 @@ class Swiper extends StatefulWidget {
                             indicatorLayout == PageIndicatorLayout.COLOR ||
                             indicatorLayout == PageIndicatorLayout.NONE)) ||
                     (loop && layout != SwiperLayout.DEFAULT)),
-            'Only support `PageIndicatorLayout.SCALE` and `PageIndicatorLayout.COLOR`when layout==SwiperLayout.DEFAULT in loop mode'),
+            'Only support `PageIndicatorLayout.SCALE` and `PageIndicatorLayout.COLOR` when layout==SwiperLayout.DEFAULT in loop mode'),
         super(key: key);
 
   factory Swiper.children({
@@ -119,7 +121,6 @@ class Swiper extends StatefulWidget {
     double? fade,
     PageIndicatorLayout indicatorLayout = PageIndicatorLayout.NONE,
     SwiperLayout layout = SwiperLayout.DEFAULT,
-    bool allowScrolling = true,
   }) =>
       Swiper(
         fade: fade,
@@ -155,7 +156,6 @@ class Swiper extends StatefulWidget {
           return children[index];
         },
         itemCount: children.length,
-        allowScrolling: allowScrolling,
       );
 
   /// If set true , the pagination will display 'outer' of the 'content' container.
@@ -250,8 +250,6 @@ class Swiper extends StatefulWidget {
 
   final bool allowImplicitScrolling;
 
-  final bool allowScrolling;
-
   static Swiper list<T>({
     PageTransformer? transformer,
     required List<T> list,
@@ -285,7 +283,6 @@ class Swiper extends StatefulWidget {
     double? fade,
     PageIndicatorLayout indicatorLayout = PageIndicatorLayout.NONE,
     SwiperLayout layout = SwiperLayout.DEFAULT,
-    bool allowScrolling = true,
   }) =>
       Swiper(
         fade: fade,
@@ -321,7 +318,6 @@ class Swiper extends StatefulWidget {
           return builder(context, list[index], index);
         },
         itemCount: list.length,
-        allowScrolling: allowScrolling,
       );
 
   @override
@@ -354,24 +350,25 @@ abstract class _SwiperTimerMixin extends State<Swiper> {
       } else {
         _stopAutoplay();
       }
-    } else if (event is IndexControllerEventBase) {
-      if (event.needToResetTimer) {
-        _startAutoplay();
-      }
     }
   }
 
   @override
   void didUpdateWidget(Swiper oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (_controller != oldWidget.controller) {
-      final oldController = oldWidget.controller;
-      if (oldController != null) {
-        oldController.removeListener(_onController);
-        _controller = oldController;
-        _controller.addListener(_onController);
-      }
+    // 修正 controller 更新邏輯：當外部 controller 改變時，正確移除舊 listener，切換到新的 controller，並確保 listener 加入一次
+    if (widget.controller != oldWidget.controller) {
+      // 移除舊外部 controller 的 listener（若存在）
+      oldWidget.controller?.removeListener(_onController);
+
+      // 切換到新的外部 controller（若沒有提供，維持內部 controller）
+      _controller = widget.controller ?? _controller;
+
+      // 確保 listener 不會被重複加入
+      _controller.removeListener(_onController);
+      _controller.addListener(_onController);
     }
+
     if (widget.autoplay != oldWidget.autoplay) {
       if (widget.autoplay) {
         _controller.startAutoplay();
@@ -399,10 +396,7 @@ abstract class _SwiperTimerMixin extends State<Swiper> {
   }
 
   Future<void> _onTimer(Timer timer) async {
-    return _controller.next(
-      animation: true,
-      needToResetTimer: false,
-    );
+    return _controller.next(animation: true);
   }
 
   void _stopAutoplay() {
@@ -415,14 +409,6 @@ class _SwiperState extends _SwiperTimerMixin {
   late int _activeIndex;
 
   TransformerPageController? _pageController;
-
-  Widget _wrapTap(BuildContext context, int index) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => widget.onTap!(index),
-      child: widget.itemBuilder!(context, index),
-    );
-  }
 
   @override
   void initState() {
@@ -453,6 +439,8 @@ class _SwiperState extends _SwiperTimerMixin {
   @override
   void didUpdateWidget(Swiper oldWidget) {
     super.didUpdateWidget(oldWidget);
+
+    // Page controller 可能需要重建（如果影響其行為的屬性變動）
     if (_isPageViewLayout()) {
       if (_pageController == null ||
           (widget.index != oldWidget.index ||
@@ -460,6 +448,17 @@ class _SwiperState extends _SwiperTimerMixin {
               widget.itemCount != oldWidget.itemCount ||
               widget.viewportFraction != oldWidget.viewportFraction ||
               _getReverse(widget) != _getReverse(oldWidget))) {
+        // 先處理舊的 page controller（若存在）避免殭屍 callback
+        if (_pageController != null) {
+          try {
+            _pageController!.dispose();
+          } catch (e) {
+            // safe guard，避免 dispose 時意外拋錯
+            log('Error disposing old pageController: $e');
+          }
+          _pageController = null;
+        }
+
         _pageController = TransformerPageController(
           initialPage: widget.index ?? widget.controller?.index ?? 0,
           loop: widget.loop,
@@ -469,14 +468,25 @@ class _SwiperState extends _SwiperTimerMixin {
         );
       }
     } else {
-      scheduleMicrotask(() {
-        // So that we have a chance to do `removeListener` in child widgets.
-        if (_pageController != null) {
+      // 若離開 DEFAULT 路徑，立即 dispose page controller（不要延遲）
+      if (_pageController != null) {
+        try {
           _pageController!.dispose();
-          _pageController = null;
+        } catch (e) {
+          log('Error disposing pageController on layout change: $e');
         }
-      });
+        _pageController = null;
+      }
     }
+
+    // 修正 controller 更新邏輯（與 mixin 保持一致）
+    if (widget.controller != oldWidget.controller) {
+      oldWidget.controller?.removeListener(_onController);
+      _controller = widget.controller ?? _controller;
+      _controller.removeListener(_onController);
+      _controller.addListener(_onController);
+    }
+
     if (widget.index != null && widget.index != _activeIndex) {
       _activeIndex = widget.index!;
     }
@@ -486,21 +496,33 @@ class _SwiperState extends _SwiperTimerMixin {
     setState(() {
       _activeIndex = index;
     });
-
-    final event = _controller.event;
-    if ((event is MoveIndexControllerEvent) && (event.newIndex != index)) {
-      return;
-    }
     widget.onIndexChanged?.call(index);
   }
 
   Widget _buildSwiper() {
-    IndexedWidgetBuilder? itemBuilder;
-    if (widget.onTap != null) {
-      itemBuilder = _wrapTap;
-    } else {
-      itemBuilder = widget.itemBuilder;
-    }
+    // userItemBuilder: 如果 itemBuilder 為 null，則在 DEFAULT path 時會拋出清楚錯誤
+    final IndexedWidgetBuilder userItemBuilder = widget.itemBuilder ??
+        (BuildContext context, int index) {
+          throw FlutterError(
+              'Swiper: itemBuilder is null. Provide an itemBuilder when using DEFAULT layout.');
+        };
+
+    // builderToUse: 若有 onTap，使用 GestureDetector 包裝；否則直接使用 userItemBuilder
+    final IndexedWidgetBuilder builderToUse = widget.onTap != null
+        ? (BuildContext context, int index) {
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () {
+                try {
+                  widget.onTap?.call(index);
+                } catch (e) {
+                  log('onTap handler error: $e');
+                }
+              },
+              child: userItemBuilder(context, index),
+            );
+          }
+        : userItemBuilder;
 
     if (widget.layout == SwiperLayout.STACK) {
       return _StackSwiper(
@@ -508,7 +530,7 @@ class _SwiperState extends _SwiperTimerMixin {
         itemWidth: widget.itemWidth,
         itemHeight: widget.itemHeight,
         itemCount: widget.itemCount,
-        itemBuilder: itemBuilder,
+        itemBuilder: builderToUse,
         index: _activeIndex,
         curve: widget.curve,
         duration: widget.duration,
@@ -518,7 +540,7 @@ class _SwiperState extends _SwiperTimerMixin {
         axisDirection: widget.axisDirection,
       );
     } else if (_isPageViewLayout()) {
-      //default
+      // default
       var transformer = widget.transformer;
       if (widget.scale != null || widget.fade != null) {
         transformer =
@@ -529,7 +551,7 @@ class _SwiperState extends _SwiperTimerMixin {
         pageController: _pageController,
         loop: widget.loop,
         itemCount: widget.itemCount,
-        itemBuilder: itemBuilder,
+        itemBuilder: builderToUse,
         transformer: transformer,
         viewportFraction: widget.viewportFraction,
         index: _activeIndex,
@@ -546,7 +568,7 @@ class _SwiperState extends _SwiperTimerMixin {
           onNotification: (notification) {
             if (notification is ScrollStartNotification) {
               if (notification.dragDetails != null) {
-                //by human
+                // by human
                 if (_timer != null) _stopAutoplay();
               }
             } else if (notification is ScrollEndNotification) {
@@ -566,7 +588,7 @@ class _SwiperState extends _SwiperTimerMixin {
         itemWidth: widget.itemWidth,
         itemHeight: widget.itemHeight,
         itemCount: widget.itemCount,
-        itemBuilder: itemBuilder,
+        itemBuilder: builderToUse,
         index: _activeIndex,
         curve: widget.curve,
         duration: widget.duration,
@@ -575,21 +597,23 @@ class _SwiperState extends _SwiperTimerMixin {
         scrollDirection: widget.scrollDirection,
       );
     } else if (widget.layout == SwiperLayout.CUSTOM) {
+      if (widget.customLayoutOption == null) {
+        throw FlutterError(
+            'Swiper: customLayoutOption must not be null when layout == SwiperLayout.CUSTOM.');
+      }
       return _CustomLayoutSwiper(
         loop: widget.loop,
         option: widget.customLayoutOption!,
         itemWidth: widget.itemWidth,
         itemHeight: widget.itemHeight,
         itemCount: widget.itemCount,
-        itemBuilder: itemBuilder,
+        itemBuilder: builderToUse,
         index: _activeIndex,
         curve: widget.curve,
         duration: widget.duration,
         onIndexChanged: _onIndexChanged,
         controller: _controller,
         scrollDirection: widget.scrollDirection,
-        axisDirection: widget.axisDirection,
-        allowScrolling: widget.allowScrolling,
       );
     } else {
       return const SizedBox.shrink();
@@ -656,6 +680,7 @@ class _SwiperState extends _SwiperTimerMixin {
     if (widget.pagination != null) {
       config = _ensureConfig(config);
       if (widget.outer) {
+        // pagination 在外面（外部容器高度/寬度已指定或不為 null）
         return _buildOuterPagination(
             widget.pagination! as SwiperPagination,
             listForStack == null ? swiper : Stack(children: listForStack),
@@ -719,7 +744,6 @@ abstract class _SubSwiper extends StatefulWidget {
     this.scrollDirection = Axis.horizontal,
     this.axisDirection = AxisDirection.left,
     this.onIndexChanged,
-    this.allowScrolling = true,
   }) : super(key: key);
 
   final IndexedWidgetBuilder? itemBuilder;
@@ -734,7 +758,6 @@ abstract class _SubSwiper extends StatefulWidget {
   final bool loop;
   final Axis? scrollDirection;
   final AxisDirection? axisDirection;
-  final bool allowScrolling;
 
   @override
   State<StatefulWidget> createState();
